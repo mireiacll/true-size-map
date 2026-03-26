@@ -75,11 +75,16 @@ closer.onclick = function () {
 };
 
 // popup and coordinates
-let originalGeometry = null;
+const originalGeometries = new globalThis.Map();
 select.on('select', function(e){
     const feature = e.selected[0];
     if (feature){
-        originalGeometry = feature.getGeometry().clone(); // save a copy of the geometry
+        if (!originalGeometries.has(feature)) {
+            originalGeometries.set(
+                feature,
+                feature.getGeometry().clone() // save original geometry once
+            );
+        }
         const properties = feature.getProperties();
         const name = properties.name || 'Unknown';
         const coordinates = e.mapBrowserEvent.coordinate; // get click position
@@ -87,10 +92,6 @@ select.on('select', function(e){
         popup.setPosition(coordinates);
     } else {
         popup.setPosition(undefined);
-        if (e.deselected[0] && originalGeometry) {  // restore on deselect
-            e.deselected[0].setGeometry(originalGeometry);
-            originalGeometry = null;
-        }
     }
 })
 
@@ -103,6 +104,16 @@ const translate = new Translate({
 translate.on('translatestart', function(){
     popup.setPosition(undefined); // hide the popup
 })
+
+const resetBtn = document.getElementById('reset-btn');
+resetBtn.onclick = function (){
+    originalGeometries.forEach((geometry,feature)=>{
+        feature.setGeometry(geometry.clone());
+    });
+    originalGeometries.clear();
+    select.getFeatures().clear();
+    popup.setPosition(undefined);
+}
 
 // basic setting
 const map = new Map({

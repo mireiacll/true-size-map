@@ -52,3 +52,19 @@ body {
 .ol-popup-closer:after {
   content: "✖";
 }
+
+#reset-btn {
+  position: absolute;
+  top: 10px;
+  left: 50px;
+  padding: 6px 10px;
+  border: none;
+  background: #2c3e50;
+  color: white;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+#reset-btn:hover {
+  background: #34495e;
+}
