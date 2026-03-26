@@ -16,6 +16,7 @@ import Select from 'ol/interaction/Select.js';
 import {click} from 'ol/events/condition.js';
 
 import Overlay from 'ol/Overlay.js';
+import Translate from 'ol/interaction/Translate.js';
 
 // GeoJSON (map countries) layer
 const vectorLayer = new VectorLayer({
@@ -58,11 +59,11 @@ const closer = document.getElementById('popup-closer');
 const popup = new Overlay({
     element: container,
     positioning: 'bottom-center',
-    // autoPan: {
-    //     animation: {
-    //     duration: 250,
-    //     },
-    // },
+    autoPan: {
+        animation: {
+        duration: 250,
+        },
+    },
 });
 
 // close button logic
@@ -74,17 +75,33 @@ closer.onclick = function () {
 };
 
 // popup and coordinates
+let originalGeometry = null;
 select.on('select', function(e){
     const feature = e.selected[0];
     if (feature){
+        originalGeometry = feature.getGeometry().clone(); // save a copy of the geometry
         const properties = feature.getProperties();
         const name = properties.name || 'Unknown';
         const coordinates = e.mapBrowserEvent.coordinate; // get click position
         content.innerHTML=`<b>${name}</b>`;
         popup.setPosition(coordinates);
-    }else{
+    } else {
         popup.setPosition(undefined);
+        if (e.deselected[0] && originalGeometry) {  // restore on deselect
+            e.deselected[0].setGeometry(originalGeometry);
+            originalGeometry = null;
+        }
     }
+})
+
+// drag
+const translate = new Translate({
+    features: select.getFeatures(),
+})
+
+// when the drag movement starts
+translate.on('translatestart', function(){
+    popup.setPosition(undefined); // hide the popup
 })
 
 // basic setting
@@ -104,4 +121,5 @@ const map = new Map({
 });
 
 map.addInteraction(select);
+map.addInteraction(translate);
 map.addOverlay(popup);
