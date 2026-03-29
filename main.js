@@ -27,6 +27,9 @@ const vectorLayer = new VectorLayer({
     format: new GeoJSON(),
   }),
   style: (feature) => feature.get('moved') ? movedStyle : defaultStyle,
+  // FIX 1 (perf): don't re-render the full layer on every pointer move frame
+  updateWhileInteracting: false,
+  updateWhileAnimating: false,
 });
 
 // --- Styles ---------------------------------------------------------------
@@ -44,7 +47,13 @@ const movedStyle = new Style({
 });
 
 // --- Select -------------------------------------------------------------
-const select = new Select({ condition: click, style: highlightStyle });
+const select = new Select({
+  condition: click,
+  style: highlightStyle,
+  // FIX 2 (perf): pixel-based hit detection (getImageData) was 25% of CPU.
+  // A small hitTolerance avoids pixel reads for each pointer move event.
+  hitTolerance: 4,
+});
 
 // --- Popup ----------------------------------------------------------
 const container = document.getElementById('popup');
@@ -57,38 +66,78 @@ const popup = new Overlay({
   autoPan: { animation: { duration: 250 } },
 });
 
-closer.onclick = function () { // close popup
+closer.onclick = function () {
   popup.setPosition(undefined);
   select.getFeatures().clear();
   closer.blur();
   return false;
 };
 
+// --- Circumpolar detection -----------------------------------------------
+// Countries like Antarctica span nearly all 360° of longitude. Their vertices
+// can't be sensibly reprojected with the cos-ratio approach, so we detect them
+// and use a plain geographic shift instead.
+function isCircumpolar(geomLL) {
+  const ext = geomLL.getExtent(); // [minLon, minLat, maxLon, maxLat] in EPSG:4326
+  return (ext[2] - ext[0]) > 300; // spans more than 300° of longitude
+}
+
 // --- True-size geometry builder ------------------------------------------------
-// Redraws a country centered on newCenterLL, preserving physical size
-// origCenterLL comes from the click point (not getExtent) to avoid antimeridian bugs
+// Redraws a country centered on newCenterLL, preserving physical size.
+// origCenterLL comes from the click point (not getExtent) to avoid antimeridian bugs.
 function buildTrueSizeGeometry(origGeomLL, origCenterLL, newCenterLL) {
   const newGeom = origGeomLL.clone();
+
+  // FIX 3 (Antarctica): circumpolar countries span the whole longitude range.
+  // The cos-ratio reprojection produces NaN/0 at poles and ±180° dLon extremes.
+  // A plain lat/lon shift preserves their (already Mercator-distorted) shape
+  // correctly without the horizontal streak artifacts.
+  if (isCircumpolar(origGeomLL)) {
+    const dLon = newCenterLL[0] - origCenterLL[0];
+    const dLat = newCenterLL[1] - origCenterLL[1];
+    newGeom.applyTransform((coords, output, stride) => {
+      stride = stride || 2;
+      for (let i = 0; i < coords.length; i += stride) {
+        const projected = fromLonLat([
+          coords[i]     + dLon,
+          Math.max(-85, Math.min(85, coords[i + 1] + dLat)),
+        ]);
+        output[i]     = projected[0];
+        output[i + 1] = projected[1];
+      }
+      return output;
+    });
+    return newGeom;
+  }
+
   newGeom.applyTransform((coords, output, stride) => {
     stride = stride || 2;
     for (let i = 0; i < coords.length; i += stride) {
 
-      // Wrap vertex lon to +-180 (fixes antimeridian countries like Russia)
+      // Wrap vertex lon to +-180 relative to the anchor (fixes antimeridian countries like Russia)
       let vertexLon = coords[i];
       while (vertexLon - origCenterLL[0] >  180) vertexLon -= 360;
       while (vertexLon - origCenterLL[0] < -180) vertexLon += 360;
 
-      const dLon = vertexLon     - origCenterLL[0]; // signed lon offset 
-      const dLat = coords[i + 1] - origCenterLL[1]; // signed lat offset 
+      const dLon = vertexLon     - origCenterLL[0];
+      const dLat = coords[i + 1] - origCenterLL[1];
 
-      // cos ratio per vertex: 1deg lon = cos(lat)*R km -> scale lon to keep physical width
-      const cosOrig  = Math.cos((origCenterLL[1] + dLat) * Math.PI / 180); // cos at original lat
-      const cosNew   = Math.cos((newCenterLL[1]  + dLat) * Math.PI / 180); // cos at destination lat
-      const lonScale = cosOrig / Math.max(Math.abs(cosNew), 0.001); // clamped to avoid div0 near poles
+      const newVertexLat = Math.max(-85, Math.min(85, newCenterLL[1] + dLat));
+
+      // FIX 4 (Antarctica / polar): clamp the latitudes fed into cos() so they
+      // never reach ±90° where cos → 0.  Without this, polar vertices collapse
+      // lonScale to 0 (or hit the cap of 8 in the other direction), producing
+      // the horizontal streak artifacts visible in the profiler screenshot.
+      const clampedOrigLat = Math.max(-80, Math.min(80, origCenterLL[1] + dLat));
+      const clampedNewLat  = Math.max(-80, Math.min(80, newVertexLat));
+
+      const cosOrig  = Math.cos(clampedOrigLat * Math.PI / 180);
+      const cosNew   = Math.cos(clampedNewLat  * Math.PI / 180);
+      const lonScale = Math.min(cosOrig / Math.max(Math.abs(cosNew), 0.001), 8);
 
       const projected = fromLonLat([
-        newCenterLL[0] + dLon * lonScale, // lon scaled to preserve physical width
-        newCenterLL[1] + dLat,            // lat offset unchanged (1deg lat = constant km)
+        newCenterLL[0] + dLon * lonScale,
+        newCenterLL[1] + dLat,
       ]);
       output[i]     = projected[0];
       output[i + 1] = projected[1];
@@ -103,15 +152,16 @@ const originalGeometriesLL = new Map(); // lon/lat geometry, never mutated
 const originalCentersLL    = new Map(); // anchor at first click, never mutated
 const currentCentersLL     = new Map(); // updated after each drag ends
 
-// Saves feature state on first interaction, using click point as anchor
-// getExtent() is avoided: gives wrong centers for antimeridian countries
+const LAT_LIMIT = 80;
+function clampLat(lat) { return Math.max(-LAT_LIMIT, Math.min(LAT_LIMIT, lat)); }
+
 function ensureStored(feature, clickCoordMerc) {
   if (originalGeometriesLL.has(feature)) return;
 
-  const centerLL = toLonLat(clickCoordMerc); // click coord -> lon/lat anchor
+  const centerLL = toLonLat(clickCoordMerc);
 
   const geomLL = feature.getGeometry().clone();
-  geomLL.transform('EPSG:3857', 'EPSG:4326'); // convert Mercator -> lon/lat
+  geomLL.transform('EPSG:3857', 'EPSG:4326');
   originalGeometriesLL.set(feature, geomLL);
   originalCentersLL.set(feature, [...centerLL]);
   currentCentersLL.set(feature, [...centerLL]);
@@ -132,7 +182,14 @@ select.on('select', function (e) {
 // --- Drag ---------------------------------------------------------------------
 const translate = new Translate({ features: select.getFeatures() });
 
-let dragStartMerc = null; // Mercator position where drag began
+let dragStartMerc = null;
+
+// FIX 5 (perf — main win): the `translating` event fires on EVERY mousemove.
+// buildTrueSizeGeometry iterates every vertex each call, which is expensive for
+// large/complex countries.  Throttle to one geometry rebuild per animation frame
+// (≤60fps) so the browser is never given more work than it can paint.
+let rafId = null;
+let pendingTranslate = null;
 
 translate.on('translatestart', function (e) {
   popup.setPosition(undefined);
@@ -141,32 +198,43 @@ translate.on('translatestart', function (e) {
 });
 
 translate.on('translating', function (e) {
-  if (!dragStartMerc) return;
+  // Snapshot the latest event; the rAF callback will pick up the most recent one.
+  pendingTranslate = e;
+  if (rafId !== null) return; // already a frame queued — don't pile up more work
 
-  // Delta in lon/lat from drag start to current pointer position
-  const startLL   = toLonLat(dragStartMerc);
-  const currentLL = toLonLat(e.coordinate);
-  const dLon = currentLL[0] - startLL[0];
-  const dLat = currentLL[1] - startLL[1];
+  rafId = requestAnimationFrame(() => {
+    rafId = null;
+    const ev = pendingTranslate;
+    pendingTranslate = null;
+    if (!ev || !dragStartMerc) return;
 
-  e.features.forEach((feature) => {
-    const origGeomLL   = originalGeometriesLL.get(feature);
-    const origCenterLL = originalCentersLL.get(feature);
-    const savedCenter  = currentCentersLL.get(feature);
-    if (!origGeomLL || !origCenterLL || !savedCenter) return;
+    const startLL   = toLonLat(dragStartMerc);
+    const currentLL = toLonLat(ev.coordinate);
+    const dLon = currentLL[0] - startLL[0];
+    const dLat = currentLL[1] - startLL[1];
 
-    const newCenterLL = [savedCenter[0] + dLon, savedCenter[1] + dLat];
-    feature.setGeometry(buildTrueSizeGeometry(origGeomLL, origCenterLL, newCenterLL));
-    feature.set('moved', true);
+    ev.features.forEach((feature) => {
+      const origGeomLL   = originalGeometriesLL.get(feature);
+      const origCenterLL = originalCentersLL.get(feature);
+      const savedCenter  = currentCentersLL.get(feature);
+      if (!origGeomLL || !origCenterLL || !savedCenter) return;
+
+      const newCenterLL = [savedCenter[0] + dLon, clampLat(savedCenter[1] + dLat)];
+      feature.setGeometry(buildTrueSizeGeometry(origGeomLL, origCenterLL, newCenterLL));
+      feature.set('moved', true);
+    });
   });
-
-  vectorLayer.getSource().changed();
 });
 
 translate.on('translateend', function (e) {
+  // Cancel any pending rAF so the end position is set cleanly on the next pick-up
+  if (rafId !== null) {
+    cancelAnimationFrame(rafId);
+    rafId = null;
+    pendingTranslate = null;
+  }
   if (!dragStartMerc) return;
 
-  // Commit delta into currentCentersLL so next drag starts from current position
   const startLL = toLonLat(dragStartMerc);
   const finalLL = toLonLat(e.coordinate);
   const dLon = finalLL[0] - startLL[0];
@@ -175,18 +243,23 @@ translate.on('translateend', function (e) {
   e.features.forEach((feature) => {
     const savedCenter = currentCentersLL.get(feature);
     if (!savedCenter) return;
-    currentCentersLL.set(feature, [savedCenter[0] + dLon, savedCenter[1] + dLat]);
+    currentCentersLL.set(feature, [savedCenter[0] + dLon, clampLat(savedCenter[1] + dLat)]);
   });
-
   dragStartMerc = null;
 });
 
 // --- Reset -----------------------------------------------------------------------
 const resetBtn = document.getElementById('reset-btn');
 resetBtn.onclick = function () {
+  // Cancel any in-flight drag RAF before clearing state
+  if (rafId !== null) {
+    cancelAnimationFrame(rafId);
+    rafId = null;
+    pendingTranslate = null;
+  }
   originalGeometriesLL.forEach((geomLL, feature) => {
     const origMerc = geomLL.clone();
-    origMerc.transform('EPSG:4326', 'EPSG:3857'); // lon/lat -> Mercator for OL
+    origMerc.transform('EPSG:4326', 'EPSG:3857');
     feature.setGeometry(origMerc);
     feature.set('moved', false);
   });
@@ -203,6 +276,8 @@ const map = new OLMap({
   layers: [new TileLayer({ source: new OSM() }), vectorLayer],
   overlays: [popup],
   view: new View({ center: [0, 0], zoom: 2 }),
+  updateWhileInteracting: false,
+  updateWhileAnimating: false,
 });
 
 map.addInteraction(select);
