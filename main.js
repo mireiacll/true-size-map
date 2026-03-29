@@ -27,7 +27,7 @@ const vectorLayer = new VectorLayer({
     format: new GeoJSON(),
   }),
   style: (feature) => feature.get('moved') ? movedStyle : defaultStyle,
-  // FIX 1 (perf): don't re-render the full layer on every pointer move frame
+  // don't re-render the full layer on every pointer move frame
   updateWhileInteracting: false,
   updateWhileAnimating: false,
 });
@@ -50,8 +50,7 @@ const movedStyle = new Style({
 const select = new Select({
   condition: click,
   style: highlightStyle,
-  // FIX 2 (perf): pixel-based hit detection (getImageData) was 25% of CPU.
-  // A small hitTolerance avoids pixel reads for each pointer move event.
+  // A small hitTolerance avoids pixel reads for each pointer move event (improve performancxe)
   hitTolerance: 4,
 });
 
@@ -74,12 +73,11 @@ closer.onclick = function () {
 };
 
 // --- Circumpolar detection -----------------------------------------------
-// Countries like Antarctica span nearly all 360° of longitude. Their vertices
-// can't be sensibly reprojected with the cos-ratio approach, so we detect them
-// and use a plain geographic shift instead.
+// Countries like Antarctica span nearly all 360° of longitude
+// Vertices can't be sensibly reprojected with the cos-ratio approach -> plain geographic shift instead.
 function isCircumpolar(geomLL) {
-  const ext = geomLL.getExtent(); // [minLon, minLat, maxLon, maxLat] in EPSG:4326
-  return (ext[2] - ext[0]) > 300; // spans more than 300° of longitude
+  const ext = geomLL.getExtent(); 
+  return (ext[2] - ext[0]) > 300; // more than 300° of longitude
 }
 
 // --- True-size geometry builder ------------------------------------------------
@@ -88,10 +86,8 @@ function isCircumpolar(geomLL) {
 function buildTrueSizeGeometry(origGeomLL, origCenterLL, newCenterLL) {
   const newGeom = origGeomLL.clone();
 
-  // FIX 3 (Antarctica): circumpolar countries span the whole longitude range.
-  // The cos-ratio reprojection produces NaN/0 at poles and ±180° dLon extremes.
+  // In circumpolar countries (antartida) cos-ratio produces NaN/0 at poles and ±180° dLon extremes
   // A plain lat/lon shift preserves their (already Mercator-distorted) shape
-  // correctly without the horizontal streak artifacts.
   if (isCircumpolar(origGeomLL)) {
     const dLon = newCenterLL[0] - origCenterLL[0];
     const dLat = newCenterLL[1] - origCenterLL[1];
@@ -124,10 +120,7 @@ function buildTrueSizeGeometry(origGeomLL, origCenterLL, newCenterLL) {
 
       const newVertexLat = Math.max(-85, Math.min(85, newCenterLL[1] + dLat));
 
-      // FIX 4 (Antarctica / polar): clamp the latitudes fed into cos() so they
-      // never reach ±90° where cos → 0.  Without this, polar vertices collapse
-      // lonScale to 0 (or hit the cap of 8 in the other direction), producing
-      // the horizontal streak artifacts visible in the profiler screenshot.
+      // (Antarctica / polar): clamp the latitudes so they never reach +-90° (cos = 0)
       const clampedOrigLat = Math.max(-80, Math.min(80, origCenterLL[1] + dLat));
       const clampedNewLat  = Math.max(-80, Math.min(80, newVertexLat));
 
@@ -183,11 +176,8 @@ select.on('select', function (e) {
 const translate = new Translate({ features: select.getFeatures() });
 
 let dragStartMerc = null;
-
-// FIX 5 (perf — main win): the `translating` event fires on EVERY mousemove.
-// buildTrueSizeGeometry iterates every vertex each call, which is expensive for
-// large/complex countries.  Throttle to one geometry rebuild per animation frame
-// (≤60fps) so the browser is never given more work than it can paint.
+// the `translating` event fires on EVERY mousemove --> iterates every vertex each call --> expensive 
+// Throttle to one geometry rebuild per animation frame (60fps) (IMPROVE PERFORMANCE)
 let rafId = null;
 let pendingTranslate = null;
 
@@ -198,9 +188,9 @@ translate.on('translatestart', function (e) {
 });
 
 translate.on('translating', function (e) {
-  // Snapshot the latest event; the rAF callback will pick up the most recent one.
+  // Snapshot the latest event; the rAF callback will pick up the most recent one
   pendingTranslate = e;
-  if (rafId !== null) return; // already a frame queued — don't pile up more work
+  if (rafId !== null) return; // already a frame queued -> don't pile up more work
 
   rafId = requestAnimationFrame(() => {
     rafId = null;
