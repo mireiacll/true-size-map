@@ -3,6 +3,7 @@ import OLMap from 'ol/Map.js';
 import OSM from 'ol/source/OSM.js';
 import TileLayer from 'ol/layer/Tile.js';
 import View from 'ol/View.js';
+import Feature from 'ol/Feature.js';
 
 import GeoJSON from 'ol/format/GeoJSON.js';
 import VectorLayer from 'ol/layer/Vector.js';
@@ -20,20 +21,8 @@ import Translate from 'ol/interaction/Translate.js';
 
 import { fromLonLat, toLonLat } from 'ol/proj.js';
 
-// --- Layer ---------------------------------------------------------------
-const vectorLayer = new VectorLayer({
-  source: new VectorSource({
-    url: './data/countries.geojson',
-    format: new GeoJSON(),
-  }),
-  style: (feature) => feature.get('moved') ? movedStyle : defaultStyle,
-  // don't re-render the full layer on every pointer move frame
-  updateWhileInteracting: false,
-  updateWhileAnimating: false,
-});
-
 // --- Styles ---------------------------------------------------------------
-const defaultStyle = new Style({ 
+const defaultStyle = new Style({
   stroke: new Stroke({ color: '#2d4257', width: 1.5 }),
   fill: new Fill({ color: 'rgba(52, 152, 219, 0.12)' }),
 });
@@ -46,15 +35,43 @@ const movedStyle = new Style({
   fill: new Fill({ color: 'rgba(155, 89, 182, 0.25)' }),
 });
 
-// --- Select -------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// TWO-LAYER ARCHITECTURE
+// staticLayer — all countries, frozen during drag
+// dragLayer   — 1 clone of the dragged feature, repaints every rAF
+// ---------------------------------------------------------------------------
+const staticSource = new VectorSource({
+  url: './data/countries.geojson',
+  format: new GeoJSON(),
+});
+
+const staticLayer = new VectorLayer({
+  source: staticSource,
+  style: (feature) => feature.get('moved') ? movedStyle : defaultStyle,
+  updateWhileInteracting: false,
+  updateWhileAnimating: false,
+});
+
+const dragSource = new VectorSource();
+const dragLayer = new VectorLayer({
+  source: dragSource,
+  style: highlightStyle,
+  updateWhileInteracting: true,
+  updateWhileAnimating: true,
+  zIndex: 10,
+});
+
+const dragClones = new Map();
+
+// --- Select ---------------------------------------------------------------
 const select = new Select({
   condition: click,
   style: highlightStyle,
-  // A small hitTolerance avoids pixel reads for each pointer move event (improve performancxe)
+  layers: [staticLayer],
   hitTolerance: 4,
 });
 
-// --- Popup ----------------------------------------------------------
+// --- Popup ----------------------------------------------------------------
 const container = document.getElementById('popup');
 const content   = document.getElementById('popup-content');
 const closer    = document.getElementById('popup-closer');
@@ -65,45 +82,102 @@ const popup = new Overlay({
   autoPan: { animation: { duration: 250 } },
 });
 
-closer.onclick = function () {
+closer.onclick = () => {
   popup.setPosition(undefined);
   select.getFeatures().clear();
   closer.blur();
   return false;
 };
 
-// --- True-size geometry builder ------------------------------------------------
-// Redraws a country centered on newCenterLL, preserving physical size.
-// origCenterLL comes from the click point (not getExtent) to avoid antimeridian bugs.
-function buildTrueSizeGeometry(origGeomLL, origCenterLL, newCenterLL, isCircumpolar) {
+// ---------------------------------------------------------------------------
+// GEODESIC OFFSET REPROJECTION
+// store (distance_m, bearing_rad) from the polygon CENTROID to each vertex.
+
+const EARTH_R = 6371000;
+const DEG     = Math.PI / 180;
+
+// Compute polygon centroid from flat lon/lat coords.
+// Longitudes are unwrapped relative to the first vertex to handle antimeridian
+// countries (Russia etc.) correctly.
+function computeCentroid(geomLL) {
+  const coords = geomLL.getFlatCoordinates();
+  if (coords.length < 2) return [0, 0];
+
+  const lon0 = coords[0];
+  let sumLon = lon0, sumLat = coords[1], n = 1;
+
+  for (let i = 2; i < coords.length; i += 2) {
+    let lon = coords[i];
+    // unwrap relative to first vertex so antimeridian crossings average correctly
+    while (lon - lon0 >  180) lon -= 360;
+    while (lon - lon0 < -180) lon += 360;
+    sumLon += lon;
+    sumLat += coords[i + 1];
+    n++;
+  }
+  return [sumLon / n, sumLat / n];
+}
+
+// Precompute [distance_m, bearing_rad] for every vertex relative to centroid.
+function toGeodesicOffsets(geomLL, centroid) {
+  const coords  = geomLL.getFlatCoordinates();
+  const out     = new Float64Array(coords.length);
+  const lat1    = centroid[1] * DEG;
+  const lon1    = centroid[0] * DEG;
+  const sinLat1 = Math.sin(lat1);
+  const cosLat1 = Math.cos(lat1);
+
+  for (let i = 0; i < coords.length; i += 2) {
+    const lat2 = coords[i + 1] * DEG;
+    const lon2 = coords[i]     * DEG;
+    const dLat = lat2 - lat1;
+    const dLon = lon2 - lon1;
+
+    // Haversine distance
+    const a    = Math.sin(dLat / 2) ** 2 + cosLat1 * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+    const dist = EARTH_R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+    // Initial bearing (clockwise from north)
+    const y       = Math.sin(dLon) * Math.cos(lat2);
+    const x       = cosLat1 * Math.sin(lat2) - sinLat1 * Math.cos(lat2) * Math.cos(dLon);
+    const bearing = Math.atan2(y, x);
+
+    out[i]     = dist;
+    out[i + 1] = bearing;
+  }
+  return out;
+}
+
+// Reproject stored geodesic offsets from newCenterLL (spherical destination-point formula).
+function buildTrueSizeGeometry(offsets, origGeomLL, newCenterLL) {
   const newGeom = origGeomLL.clone();
+  const lat1    = newCenterLL[1] * DEG;
+  const lon1    = newCenterLL[0] * DEG;
+  const sinLat1 = Math.sin(lat1);
+  const cosLat1 = Math.cos(lat1);
 
   newGeom.applyTransform((coords, output, stride = 2) => {
     for (let i = 0; i < coords.length; i += stride) {
-      let vertexLon = coords[i];
+      const dist    = offsets[i];
+      const bearing = offsets[i + 1];
+      const angDist = dist / EARTH_R;
+      const sinAng  = Math.sin(angDist);
+      const cosAng  = Math.cos(angDist);
 
-      // Wrapping breaks circumpolar countries (vertices span ±180°)
-      // so skip it for Antarctica — per-vertex cos scaling still applies
-      if (!isCircumpolar) {
-        while (vertexLon - origCenterLL[0] >  180) vertexLon -= 360;
-        while (vertexLon - origCenterLL[0] < -180) vertexLon += 360;
-      }
-
-      const dLon = vertexLon - origCenterLL[0];
-      const dLat = coords[i + 1] - origCenterLL[1];
-
-      const clampedOrigLat = Math.max(-80, Math.min(80, origCenterLL[1] + dLat));
-      const clampedNewLat  = Math.max(-80, Math.min(80, newCenterLL[1]  + dLat));
-
-      const cosOrig  = Math.cos(clampedOrigLat * Math.PI / 180);
-      const cosNew   = Math.cos(clampedNewLat  * Math.PI / 180);
-      const lonScale = Math.min(cosOrig / Math.max(Math.abs(cosNew), 0.001), 8);
+      const lat2 = Math.asin(
+        sinLat1 * cosAng + cosLat1 * sinAng * Math.cos(bearing)
+      );
+      const lon2 = lon1 + Math.atan2(
+        Math.sin(bearing) * sinAng * cosLat1,
+        cosAng - sinLat1 * Math.sin(lat2)
+      );
 
       const p = fromLonLat([
-        newCenterLL[0] + dLon * lonScale,
-        newCenterLL[1] + dLat,
+        lon2 / DEG,
+        Math.max(-85, Math.min(85, lat2 / DEG)),
       ]);
-      output[i] = p[0]; output[i + 1] = p[1];
+      output[i]     = p[0];
+      output[i + 1] = p[1];
     }
     return output;
   });
@@ -111,135 +185,182 @@ function buildTrueSizeGeometry(origGeomLL, origCenterLL, newCenterLL, isCircumpo
   return newGeom;
 }
 
-// --- Per-feature state ----------------------------------------------------------
-const originalGeometriesLL = new Map(); // lon/lat geometry, never mutated
-const originalCentersLL    = new Map(); // anchor at first click, never mutated
-const currentCentersLL     = new Map(); // updated after each drag ends
+// --- Per-feature state ----------------------------------------------------
+const originalGeometriesLL = new Map();
+const currentCentersLL     = new Map(); // centroid, moves with each drag
+const featureOffsets       = new Map(); // geodesic offsets from centroid
 
 const LAT_LIMIT = 80;
-function clampLat(lat) { return Math.max(-LAT_LIMIT, Math.min(LAT_LIMIT, lat)); }
+const clampLat  = (lat) => Math.max(-LAT_LIMIT, Math.min(LAT_LIMIT, lat));
 
 function ensureStored(feature, clickCoordMerc) {
-    if (originalGeometriesLL.has(feature)) return;
+  if (originalGeometriesLL.has(feature)) return;
 
-    const centerLL = toLonLat(clickCoordMerc);
+  const geomLL   = feature.getGeometry().clone();
+  geomLL.transform('EPSG:3857', 'EPSG:4326');
 
-    const geomLL = feature.getGeometry().clone();
-    geomLL.transform('EPSG:3857', 'EPSG:4326');
-    originalGeometriesLL.set(feature, geomLL);
-    originalCentersLL.set(feature, [...centerLL]);
-    currentCentersLL.set(feature, [...centerLL]);
+  // Use centroid as geodesic anchor — keeps all angular distances small and stable.
+  // The click point only determines drag delta; the centroid is what actually moves.
+  const centroid = computeCentroid(geomLL);
+
+  originalGeometriesLL.set(feature, geomLL);
+  currentCentersLL.set(feature, [...centroid]);
+  featureOffsets.set(feature, toGeodesicOffsets(geomLL, centroid));
 }
 
-// --- Select handler -----------------------------------------------------------
-select.on('select', function (e) {
-    const feature = e.selected[0];
-    if (feature) {
-        ensureStored(feature, e.mapBrowserEvent.coordinate);
-        content.innerHTML = `<b>${feature.get('name') || 'Unknown'}</b>`;
-        popup.setPosition(e.mapBrowserEvent.coordinate);
-    } else {
-        popup.setPosition(undefined);
-    }
+// --- Select handler -------------------------------------------------------
+select.on('select', (e) => {
+  const feature = e.selected[0];
+  if (feature) {
+    ensureStored(feature, e.mapBrowserEvent.coordinate);
+    content.innerHTML = `<b>${feature.get('name') || 'Unknown'}</b>`;
+    popup.setPosition(e.mapBrowserEvent.coordinate);
+  } else {
+    popup.setPosition(undefined);
+  }
 });
 
-// --- Drag ---------------------------------------------------------------------
+// --- Translate ------------------------------------------------------------
 const translate = new Translate({ features: select.getFeatures() });
 
 let dragStartMerc = null;
-// the `translating` event fires on EVERY mousemove --> iterates every vertex each call --> expensive 
-// Throttle to one geometry rebuild per animation frame (60fps) (IMPROVE PERFORMANCE)
-let rafId = null;
-let pendingTranslate = null;
+let rafId         = null;
+let pendingEvent  = null;
 
-translate.on('translatestart', function (e) {
-    popup.setPosition(undefined);
-    dragStartMerc = e.coordinate;
-    e.features.forEach((f) => ensureStored(f, e.coordinate));
+translate.on('translatestart', (e) => {
+  popup.setPosition(undefined);
+  dragStartMerc = e.coordinate;
+
+  e.features.forEach((feature) => {
+    ensureStored(feature, e.coordinate);
+
+    // Clone → dragLayer (only thing repainting every frame)
+    const clone = new Feature({ geometry: feature.getGeometry().clone() });
+    dragClones.set(feature, clone);
+    dragSource.addFeature(clone);
+
+    // Remove original synchronously — no ghost at original position
+    staticSource.removeFeature(feature);
+
+    // Block OL's Translate from calling geometry.translate() on the original
+    const geom = feature.getGeometry();
+    geom._origTranslate = geom.translate.bind(geom);
+    geom.translate = () => {};
+  });
 });
 
-translate.on('translating', function (e) {
-    // Snapshot the latest event; the rAF callback will pick up the most recent one
-    pendingTranslate = e;
-    if (rafId !== null) return; // already a frame queued -> don't pile up more work
+translate.on('translating', (e) => {
+  pendingEvent = e;
+  if (rafId !== null) return;
 
-    rafId = requestAnimationFrame(() => {
-        rafId = null;
-        const ev = pendingTranslate;
-        pendingTranslate = null;
-        if (!ev || !dragStartMerc) return;
+  rafId = requestAnimationFrame(() => {
+    rafId = null;
+    const ev = pendingEvent;
+    pendingEvent = null;
+    if (!ev || !dragStartMerc) return;
 
-        const startLL   = toLonLat(dragStartMerc);
-        const currentLL = toLonLat(ev.coordinate);
-        const dLon = currentLL[0] - startLL[0];
-        const dLat = currentLL[1] - startLL[1];
+    const startLL   = toLonLat(dragStartMerc);
+    const currentLL = toLonLat(ev.coordinate);
+    const dLon = currentLL[0] - startLL[0];
+    const dLat = currentLL[1] - startLL[1];
 
-        ev.features.forEach((feature) => {
-        const origGeomLL   = originalGeometriesLL.get(feature);
-        const origCenterLL = originalCentersLL.get(feature);
-        const savedCenter  = currentCentersLL.get(feature);
-        if (!origGeomLL || !origCenterLL || !savedCenter) return;
+    ev.features.forEach((feature) => {
+      const origGeomLL  = originalGeometriesLL.get(feature);
+      const savedCenter = currentCentersLL.get(feature);
+      const offsets     = featureOffsets.get(feature);
+      if (!origGeomLL || !savedCenter || !offsets) return;
 
-        const isCircumpolarFlag = feature.get('name') =="Antarctica";
-        const newCenterLL = [savedCenter[0] + dLon, clampLat(savedCenter[1] + dLat)];
-        feature.setGeometry(buildTrueSizeGeometry(origGeomLL, origCenterLL, newCenterLL,isCircumpolarFlag));
-        feature.set('moved', true);
-        });
+      const newCenterLL = [savedCenter[0] + dLon, clampLat(savedCenter[1] + dLat)];
+
+      const clone = dragClones.get(feature);
+      if (clone) {
+        clone.setGeometry(buildTrueSizeGeometry(offsets, origGeomLL, newCenterLL));
+      }
     });
+  });
 });
 
-translate.on('translateend', function (e) {
-  // Cancel any pending rAF so the end position is set cleanly on the next pick-up
-  if (rafId !== null) {
-        cancelAnimationFrame(rafId);
-        rafId = null;
-        pendingTranslate = null;
-  }
+translate.on('translateend', (e) => {
+  if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; pendingEvent = null; }
   if (!dragStartMerc) return;
 
-    const startLL = toLonLat(dragStartMerc);
-    const finalLL = toLonLat(e.coordinate);
-    const dLon = finalLL[0] - startLL[0];
-    const dLat = finalLL[1] - startLL[1];
+  const startLL = toLonLat(dragStartMerc);
+  const finalLL = toLonLat(e.coordinate);
+  const dLon = finalLL[0] - startLL[0];
+  const dLat = finalLL[1] - startLL[1];
 
-    e.features.forEach((feature) => {
-        const savedCenter = currentCentersLL.get(feature);
-        if (!savedCenter) return;
-        currentCentersLL.set(feature, [savedCenter[0] + dLon, clampLat(savedCenter[1] + dLat)]);
-    });
-    dragStartMerc = null;
+  e.features.forEach((feature) => {
+    // Restore geometry.translate
+    const geom = feature.getGeometry();
+    if (geom._origTranslate) {
+      geom.translate = geom._origTranslate;
+      delete geom._origTranslate;
+    }
+
+    const savedCenter = currentCentersLL.get(feature);
+    const offsets     = featureOffsets.get(feature);
+    const origGeomLL  = originalGeometriesLL.get(feature);
+
+    if (savedCenter && offsets && origGeomLL) {
+      const newCenter = [savedCenter[0] + dLon, clampLat(savedCenter[1] + dLat)];
+      currentCentersLL.set(feature, newCenter);
+
+      const clone = dragClones.get(feature);
+      if (clone) {
+        feature.setGeometry(clone.getGeometry().clone());
+        feature.set('moved', true);
+        dragSource.removeFeature(clone);
+        dragClones.delete(feature);
+      }
+    }
+
+    staticSource.addFeature(feature);
+  });
+
+  dragStartMerc = null;
 });
 
-// --- Reset -----------------------------------------------------------------------
-const resetBtn = document.getElementById('reset-btn');
-resetBtn.onclick = function () {
-    // Cancel any in-flight drag RAF before clearing state
-    if (rafId !== null) {
-        cancelAnimationFrame(rafId);
-        rafId = null;
-        pendingTranslate = null;
+// --- Reset ----------------------------------------------------------------
+document.getElementById('reset-btn').onclick = () => {
+  if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; pendingEvent = null; }
+
+  dragClones.forEach((clone, feature) => {
+    const geom = feature.getGeometry();
+    if (geom._origTranslate) {
+      geom.translate = geom._origTranslate;
+      delete geom._origTranslate;
     }
-    originalGeometriesLL.forEach((geomLL, feature) => {
-        const origMerc = geomLL.clone();
-        origMerc.transform('EPSG:4326', 'EPSG:3857');
-        feature.setGeometry(origMerc);
-        feature.set('moved', false);
-    });
-    originalGeometriesLL.clear();
-    originalCentersLL.clear();
-    currentCentersLL.clear();
-    select.getFeatures().clear();
-    popup.setPosition(undefined);
+    dragSource.removeFeature(clone);
+    if (!staticSource.hasFeature(feature)) staticSource.addFeature(feature);
+  });
+  dragClones.clear();
+
+  originalGeometriesLL.forEach((geomLL, feature) => {
+    const origMerc = geomLL.clone();
+    origMerc.transform('EPSG:4326', 'EPSG:3857');
+    feature.setGeometry(origMerc);
+    feature.set('moved', false);
+  });
+  originalGeometriesLL.clear();
+  currentCentersLL.clear();
+  featureOffsets.clear();
+
+  select.getFeatures().clear();
+  popup.setPosition(undefined);
 };
 
-// --- Map ------------------------------------------------------------------------
+// --- Map ------------------------------------------------------------------
 const map = new OLMap({
-    target: 'map',
-    layers: [new TileLayer({ source: new OSM() }), vectorLayer],
-    overlays: [popup],
-    view: new View({ center: [0, 0], zoom: 2 }),
-    updateWhileInteracting: false,
-    updateWhileAnimating: false,
+  target: 'map',
+  layers: [
+    new TileLayer({ source: new OSM() }),
+    staticLayer,
+    dragLayer,
+  ],
+  overlays: [popup],
+  view: new View({ center: [0, 0], zoom: 2 }),
+  updateWhileInteracting: false,
+  updateWhileAnimating: false,
 });
 
 map.addInteraction(select);
