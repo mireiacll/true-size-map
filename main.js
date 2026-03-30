@@ -72,23 +72,15 @@ closer.onclick = function () {
   return false;
 };
 
-// --- Circumpolar detection -----------------------------------------------
-// Countries like Antarctica span nearly all 360° of longitude
-// Vertices can't be sensibly reprojected with the cos-ratio approach -> plain geographic shift instead.
-function isCircumpolar(geomLL) {
-  const ext = geomLL.getExtent(); 
-  return (ext[2] - ext[0]) > 300; // more than 300° of longitude
-}
-
 // --- True-size geometry builder ------------------------------------------------
 // Redraws a country centered on newCenterLL, preserving physical size.
 // origCenterLL comes from the click point (not getExtent) to avoid antimeridian bugs.
-function buildTrueSizeGeometry(origGeomLL, origCenterLL, newCenterLL) {
+function buildTrueSizeGeometry(origGeomLL, origCenterLL, newCenterLL, isCircumpolarFlag) {
   const newGeom = origGeomLL.clone();
 
   // In circumpolar countries (antartida) cos-ratio produces NaN/0 at poles and ±180° dLon extremes
   // A plain lat/lon shift preserves their (already Mercator-distorted) shape
-  if (isCircumpolar(origGeomLL)) {
+  if (isCircumpolarFlag) {
     const dLon = newCenterLL[0] - origCenterLL[0];
     const dLat = newCenterLL[1] - origCenterLL[1];
     newGeom.applyTransform((coords, output, stride) => {
@@ -209,8 +201,9 @@ translate.on('translating', function (e) {
       const savedCenter  = currentCentersLL.get(feature);
       if (!origGeomLL || !origCenterLL || !savedCenter) return;
 
+      const isCircumpolarFlag = feature.get('name') =="Antarctica";
       const newCenterLL = [savedCenter[0] + dLon, clampLat(savedCenter[1] + dLat)];
-      feature.setGeometry(buildTrueSizeGeometry(origGeomLL, origCenterLL, newCenterLL));
+      feature.setGeometry(buildTrueSizeGeometry(origGeomLL, origCenterLL, newCenterLL,isCircumpolarFlag));
       feature.set('moved', true);
     });
   });
