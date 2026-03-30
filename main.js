@@ -153,7 +153,7 @@ const originalGeometriesLL = new Map(); // lon/lat geometry, never mutated
 const originalCentersLL    = new Map(); // anchor at first click, never mutated
 const currentCentersLL     = new Map(); // updated after each drag ends
 
-const LAT_LIMIT = 80;
+const LAT_LIMIT = 85;
 function clampLat(lat) { return Math.max(-LAT_LIMIT, Math.min(LAT_LIMIT, lat)); }
 
 function ensureStored(feature, clickCoordMerc) {
