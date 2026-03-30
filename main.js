@@ -81,22 +81,38 @@ function buildTrueSizeGeometry(origGeomLL, origCenterLL, newCenterLL, isCircumpo
   // In circumpolar countries (antartida) cos-ratio produces NaN/0 at poles and ±180° dLon extremes
   // A plain lat/lon shift preserves their (already Mercator-distorted) shape
   if (isCircumpolarFlag) {
-    const dLon = newCenterLL[0] - origCenterLL[0];
+    // --- relative scaling ---
+    const cosOrig = Math.cos(origCenterLL[1] * Math.PI / 180);
+    const cosNew  = Math.cos(newCenterLL[1] * Math.PI / 180);
+    const scaleX = Math.min(
+        Math.max(cosOrig / Math.max(Math.abs(cosNew), 0.001), 0.5),
+        3
+    );
     const dLat = newCenterLL[1] - origCenterLL[1];
     newGeom.applyTransform((coords, output, stride) => {
-      stride = stride || 2;
-      for (let i = 0; i < coords.length; i += stride) {
-        const projected = fromLonLat([
-          coords[i]     + dLon,
-          Math.max(-85, Math.min(85, coords[i + 1] + dLat)),
-        ]);
+        stride = stride || 2;
+        for (let i = 0; i < coords.length; i += stride) {
+        const lon = coords[i];
+        const lat = coords[i + 1];
+        // --- horizontal scaling around original center ---
+        const newLon =
+            origCenterLL[0] +
+            (lon - origCenterLL[0]) * scaleX;
+        // --- vertical movement only (NO scaling) ---
+        const newLat = Math.max(
+            -85,
+            Math.min(85, lat + dLat)
+        );
+        const projected = fromLonLat([newLon, newLat]);
         output[i]     = projected[0];
         output[i + 1] = projected[1];
-      }
-      return output;
+        }
+
+        return output;
     });
+
     return newGeom;
-  }
+    }
 
   newGeom.applyTransform((coords, output, stride) => {
     stride = stride || 2;
