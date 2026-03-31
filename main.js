@@ -41,7 +41,7 @@ const movedStyle = new Style({
 // dragLayer   — 1 clone of the dragged feature, repaints every rAF
 // ---------------------------------------------------------------------------
 const staticSource = new VectorSource({
-  url: './data/countries.geojson',
+  url: './data/countries_1000.geojson',
   format: new GeoJSON(),
 });
 
@@ -149,40 +149,94 @@ function toGeodesicOffsets(geomLL, centroid) {
 }
 
 // Reproject stored geodesic offsets from newCenterLL (spherical destination-point formula).
-function buildTrueSizeGeometry(offsets, origGeomLL, newCenterLL) {
-  const newGeom = origGeomLL.clone();
-  const lat1    = newCenterLL[1] * DEG;
-  const lon1    = newCenterLL[0] * DEG;
-  const sinLat1 = Math.sin(lat1);
-  const cosLat1 = Math.cos(lat1);
+// includes antartica logic to 'stitch' the shape to the map boundaries (Antimeridian)
+function buildTrueSizeGeometry(offsets, originalGeomLL, newCenterLL) {
+  const centerLatRad = newCenterLL[1] * DEG;
+  const centerLonRad = newCenterLL[0] * DEG;
+  const sinCenterLat = Math.sin(centerLatRad);
+  const cosCenterLat = Math.cos(centerLatRad);
+  
+  let offsetPointer = 0;
 
-  newGeom.applyTransform((coords, output, stride = 2) => {
-    for (let i = 0; i < coords.length; i += stride) {
-      const dist    = offsets[i];
-      const bearing = offsets[i + 1];
-      const angDist = dist / EARTH_R;
-      const sinAng  = Math.sin(angDist);
-      const cosAng  = Math.cos(angDist);
+  const processCoordinates = (ring) => {
+    const projectedPoints = [];
+    let prevLon = null;
+    let firstLon = null;
+    let firstLat = null;
+    let lastLat = null;
 
-      const lat2 = Math.asin(
-        sinLat1 * cosAng + cosLat1 * sinAng * Math.cos(bearing)
+    for (let i = 0; i < ring.length; i++) {
+      // 1. Calculate destination point using geodesic offsets
+      const distance = offsets[offsetPointer++];
+      const bearing = offsets[offsetPointer++];
+      const angularDist = distance / EARTH_R;
+
+      const latRad = Math.asin(
+        sinCenterLat * Math.cos(angularDist) + 
+        cosCenterLat * Math.sin(angularDist) * Math.cos(bearing)
       );
-      const lon2 = lon1 + Math.atan2(
-        Math.sin(bearing) * sinAng * cosLat1,
-        cosAng - sinLat1 * Math.sin(lat2)
+      const lonRad = centerLonRad + Math.atan2(
+        Math.sin(bearing) * Math.sin(angularDist) * cosCenterLat,
+        Math.cos(angularDist) - sinCenterLat * Math.sin(latRad)
       );
 
-      const p = fromLonLat([
-        lon2 / DEG,
-        Math.max(-85, Math.min(85, lat2 / DEG)),
-      ]);
-      output[i]     = p[0];
-      output[i + 1] = p[1];
+      const lonDeg = lonRad / DEG;
+      const latDeg = Math.max(-85, Math.min(85, latRad / DEG)); // Clamp to Mercator limits
+
+      if (firstLon === null) { 
+        firstLon = lonDeg; 
+        firstLat = latDeg; 
+      }
+
+      // 2. Detect if the segment crosses the Antimeridian (180/-180 jump)
+      if (prevLon !== null && Math.abs(lonDeg - prevLon) > 180) {
+        addBoundaryStitch(projectedPoints, prevLon, lonDeg, latDeg);
+      }
+
+      projectedPoints.push([lonDeg, latDeg]);
+      prevLon = lonDeg;
+      lastLat = latDeg;
     }
-    return output;
-  });
 
-  return newGeom;
+    // 3. Close the loop: Check if the return path to the first vertex crosses the map edge
+    if (prevLon !== null && Math.abs(prevLon - firstLon) > 180) {
+      addBoundaryStitch(projectedPoints, prevLon, firstLon, firstLat);
+    }
+
+    return projectedPoints;
+  };
+
+  /**
+   * Forces the polygon path to follow the map boundary (Down -> Across -> Up).
+   * This prevents the renderer from drawing "shortcuts" across the center of the map.
+   */
+  function addBoundaryStitch(targetArray, startLon, endLon, targetLat) {
+    const isWrappingRight = (endLon - startLon) < 0;
+    const edgeLon = isWrappingRight ? 180 : -180;
+    const oppositeEdgeLon = isWrappingRight ? -180 : 180;
+    
+    // Use -85 for Southern Hemisphere (Antarctica) or 85 for Northern Hemisphere
+    const boundaryLat = targetLat < 0 ? -85 : 85;
+
+    targetArray.push([startLon, boundaryLat]);        // Drop vertically to boundary
+    targetArray.push([edgeLon, boundaryLat]);         // Slide to the edge of the map
+    targetArray.push([oppositeEdgeLon, boundaryLat]);   // Teleport to the opposite edge
+    targetArray.push([endLon, boundaryLat]);          // Slide to the target longitude
+  }
+
+  const geomType = originalGeomLL.getType();
+  const rawCoords = originalGeomLL.getCoordinates();
+  
+  const transformedCoords = (geomType === 'Polygon') 
+    ? rawCoords.map(processCoordinates) 
+    : rawCoords.map(polygon => polygon.map(processCoordinates));
+
+  // Rebuild the geometry in Web Mercator (EPSG:3857) for display
+  const resultGeom = originalGeomLL.clone();
+  resultGeom.setCoordinates(transformedCoords);
+  resultGeom.transform('EPSG:4326', 'EPSG:3857');
+  
+  return resultGeom;
 }
 
 // --- Per-feature state ----------------------------------------------------
