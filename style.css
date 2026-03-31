@@ -1,28 +1,225 @@
 @import "node_modules/ol/ol.css";
 
-html,
-body {
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
   margin: 0;
   height: 100%;
+  font-family: 'DM Sans', sans-serif;
 }
 
 #map {
   position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 100%;
+  inset: 0;
 }
 
+.ol-layer canvas {
+  will-change: transform;
+}
+
+/* ── top bar ────────────────────────────────────────────── */
+#topbar {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  z-index: 100;
+  background: rgba(255,255,255,0.92);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(0,0,0,0.09);
+  border-radius: 12px;
+  padding: 6px 8px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.12);
+  white-space: nowrap;
+}
+
+/* ── mode toggle ────────────────────────────────────────── */
+#mode-toggle {
+  display: flex;
+  gap: 3px;
+  background: #f0f0f0;
+  border-radius: 8px;
+  padding: 3px;
+}
+
+.mode-btn {
+  padding: 5px 14px;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  color: #666;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.mode-btn.active {
+  background: #fff;
+  color: #1a1a1a;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+}
+
+.mode-btn:not(.active):hover {
+  color: #333;
+}
+
+/* ── search box ─────────────────────────────────────────── */
+#search-box {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+#search-box.hidden {
+  display: none;
+}
+
+#search-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #f5f5f5;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 5px 10px;
+  width: 220px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+#search-wrap:focus-within {
+  border-color: #2d4257;
+  box-shadow: 0 0 0 3px rgba(45,66,87,0.1);
+  background: #fff;
+}
+
+#search-icon {
+  width: 15px;
+  height: 15px;
+  color: #999;
+  flex-shrink: 0;
+}
+
+#search-input {
+  border: none;
+  background: transparent;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 13px;
+  color: #1a1a1a;
+  outline: none;
+  width: 100%;
+  min-width: 0;
+}
+
+#search-input::placeholder {
+  color: #aaa;
+}
+
+#search-clear {
+  border: none;
+  background: none;
+  color: #aaa;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+  line-height: 1;
+  flex-shrink: 0;
+  transition: color 0.1s;
+}
+
+#search-clear:hover { color: #e74c3c; }
+#search-clear.hidden { display: none; }
+
+/* ── dropdown ───────────────────────────────────────────── */
+#search-dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  width: 220px;
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 10px;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.12);
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  max-height: 260px;
+  overflow-y: auto;
+  z-index: 200;
+}
+
+#search-dropdown.hidden { display: none; }
+
+#search-dropdown li {
+  padding: 8px 12px;
+  border-radius: 7px;
+  font-size: 13px;
+  color: #333;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: background 0.1s;
+}
+
+#search-dropdown li:hover,
+#search-dropdown li.active {
+  background: #f0f4f8;
+  color: #1a1a1a;
+}
+
+#search-dropdown li.added {
+  color: #8e44ad;
+}
+
+#search-dropdown li .check {
+  margin-left: auto;
+  font-size: 11px;
+  opacity: 0.6;
+}
+
+#search-dropdown .no-results {
+  padding: 10px 12px;
+  color: #aaa;
+  font-size: 13px;
+  cursor: default;
+}
+
+#search-dropdown .no-results:hover {
+  background: transparent;
+}
+
+/* ── reset button ───────────────────────────────────────── */
+#reset-btn {
+  padding: 6px 14px;
+  border: none;
+  background: #2c3e50;
+  color: white;
+  border-radius: 8px;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+  flex-shrink: 0;
+}
+
+#reset-btn:hover { background: #34495e; }
+
+/* ── popup ──────────────────────────────────────────────── */
 .ol-popup {
-  /* position: absolute; */
-  background-color: white;
-  padding: 10px;
-  padding-right: 30px;
+  background: white;
+  padding: 10px 28px 10px 14px;
   border-radius: 10px;
   border: 1px solid #ddd;
   box-shadow: 0 4px 12px rgba(0,0,0,0.15);
   font-size: 13px;
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: 'DM Sans', sans-serif;
+  min-width: 120px;
 }
 
 .ol-popup:after {
@@ -41,30 +238,8 @@ body {
   top: 8px;
   right: 8px;
   text-decoration: none;
-  font-size: 14px;
-  color: #888;
+  font-size: 13px;
+  color: #aaa;
 }
-
-.ol-popup-closer:hover {
-  color: #e74c3c;
-}
-
-.ol-popup-closer:after {
-  content: "✖";
-}
-
-#reset-btn {
-  position: absolute;
-  top: 10px;
-  left: 50px;
-  padding: 6px 10px;
-  border: none;
-  background: #2c3e50;
-  color: white;
-  border-radius: 6px;
-  cursor: pointer;
-}
-
-#reset-btn:hover {
-  background: #34495e;
-}
+.ol-popup-closer:hover { color: #e74c3c; }
+.ol-popup-closer:after { content: "✖"; }
