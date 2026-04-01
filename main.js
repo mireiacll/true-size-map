@@ -407,9 +407,6 @@ btnAll.onclick = () => {
   select.getFeatures().clear();
   translateFeatures.clear();
   popup.setPosition(undefined);
-  originalGeometriesLL.clear();
-  currentCentersLL.clear();
-  featureOffsets.clear();
 };
 
 btnSearch.onclick = () => {
@@ -425,9 +422,6 @@ btnSearch.onclick = () => {
   select.getFeatures().clear();
   translateFeatures.clear();
   popup.setPosition(undefined);
-  originalGeometriesLL.clear();
-  currentCentersLL.clear();
-  featureOffsets.clear();
 
   searchInput.focus();
 };
